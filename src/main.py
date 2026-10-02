@@ -1,510 +1,852 @@
+"""
+================================================================================
+The Incumbent Tax: A Stochastic Assessment of Pre-Election Clientelism and
+Fiscal Insolvency in Philippine Local Government Units
+--------------------------------------------------------------------------------
+v5 — three-level analysis (Province / City / Municipality).
+
+  • Province electoral panel: election_panel_hybrid.csv
+      - COMELEC 1992-2004 + OpenHalalan 2007-2025 (hybrid)
+  • City + Municipality electoral panel: election_panel_mayor.csv
+      - OpenHalalan 2007-2025 (mayoral races)
+  • Three-level Table 2 (elasticities) and Table 3 (Monte Carlo)
+  • Level filter applied inside estimate_elasticities() and
+    calibrate_lognormal()
+================================================================================
+"""
+
 import os
+import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy.stats import lognorm, norm
+from scipy import stats
 import statsmodels.api as sm
 
 # -----------------------------------------------------------------------------
-# GLOBAL SETTINGS & OUTPUT DIRECTORY
+# GLOBAL SETTINGS
 # -----------------------------------------------------------------------------
 sns.set_theme(style="whitegrid", palette="muted")
 plt.rcParams.update({
-    'font.size': 11,
-    'axes.labelsize': 12,
-    'axes.titlesize': 14,
-    'xtick.labelsize': 10,
-    'ytick.labelsize': 10,
-    'figure.titlesize': 16
+    "font.size": 11, "axes.labelsize": 12, "axes.titlesize": 13,
+    "xtick.labelsize": 10, "ytick.labelsize": 10,
+    "figure.titlesize": 14, "figure.dpi": 300,
 })
 
-OUTPUT_DIR = os.path.join("..", "outputs")
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+OUTPUT_DIR = os.path.join(_PROJECT_ROOT, "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# -----------------------------------------------------------------------------
-# 1. DATA CLEANING
-# -----------------------------------------------------------------------------
-def load_and_clean_data(file_path):
-    df = pd.read_excel(file_path, engine='openpyxl')
-    
-    numeric_cols = [
-        'totlocsrc', 'ira', 'govexp', 'pubwelf', 'educexp', 'healthexp', 
-        'totexp', 'lgusincome', 'tottax', 'votes', 'totvot', 'pi', 'ENC_lt',
-        'laborexp', 'housingexp', 'socservexp', 'econdevexp'
-    ]
-    
-    for col in numeric_cols:
-        if col in df.columns:
-            if df[col].dtype == object:
-                df[col] = df[col].astype(str).str.replace(',', '').str.strip()
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-    
-    sectoral_cols = ['educexp', 'healthexp', 'pubwelf', 'govexp', 'laborexp', 
-                     'housingexp', 'socservexp', 'econdevexp']
-    for col in sectoral_cols:
-        if col in df.columns:
-            df[col] = df[col].replace(0, np.nan)
-            
-    for col in ['totlocsrc', 'ira', 'totexp']:
-        if col in df.columns:
-            q99 = df[col].quantile(0.99)
-            df[col] = np.where(df[col] > q99, q99, df[col])
-            
+RANDOM_SEED = 42
+N_SIM = 10_000
+N_YEARS = 10
+INSOLVENCY_THRESHOLD = 0.05
+REV_CORR_DEFAULT = 0.45
+
+ELECTION_YEARS = [1992, 1995, 1998, 2001, 2004, 2007, 2010,
+                  2013, 2016, 2019, 2022, 2025]
+
+CPI_FALLBACK = {year: 100.0 for year in range(1992, 2026)}
+
+
+# =============================================================================
+# 1. DATA LOADERS
+# =============================================================================
+def load_fiscal_panel(panel_path: str) -> pd.DataFrame:
+    df = pd.read_csv(panel_path, low_memory=False)
+
+    df["psgc10"] = (df["psgc10"].astype(str).str.strip()
+                    .str.replace(r"\.0$", "", regex=True).str.zfill(10))
+    df["lgu"] = df["lgu_name"].astype(str).str.strip().str.upper()
+    df["lgutype"] = df["lgu_type"].astype(str).str.strip()
+    df["year"] = pd.to_numeric(df["fiscal_year"], errors="coerce")
+
+    if "in_sre" in df.columns:
+        df = df[df["in_sre"].astype(str).str.lower()
+                  .isin(["true", "1", "yes"])]
+
+    sum_cols = [c for c in [
+        "total_local_sources", "nta_ira", "other_national_shares",
+        "total_external_sources", "total_current_operating_income",
+        "education", "health", "social_welfare", "total_social_services",
+        "gps", "economic_services", "total_current_operating_exp",
+        "total_capital_investment_exp", "total_non_operating_exp",
+        "total_expenditures",
+    ] if c in df.columns]
+
+    agg = {c: "sum" for c in sum_cols}
+    for c in ["lgu", "lgutype", "province", "region", "income_class",
+              "pop_2024", "poverty_pi"]:
+        if c in df.columns:
+            agg[c] = "first"
+
+    df = df.groupby(["psgc10", "year"], as_index=False).agg(agg)
+
+    df = df.rename(columns={
+        "total_local_sources": "totlocsrc", "nta_ira": "ira",
+        "total_expenditures": "totexp", "social_welfare": "pubwelf",
+        "education": "educexp", "health": "healthexp", "gps": "govexp",
+        "pop_2024": "population", "poverty_pi": "poverty",
+    })
+
+    for c in ["totlocsrc", "ira", "totexp", "pubwelf", "educexp",
+              "healthexp", "govexp", "population", "poverty"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    for c in ["totlocsrc", "ira", "totexp", "pubwelf"]:
+        if c in df.columns:
+            df = df[df[c].isna() | (df[c] <= 1e8)]
+
+    for c in ["educexp", "healthexp", "pubwelf", "govexp"]:
+        if c in df.columns:
+            df[c] = df[c].replace(0, np.nan)
+
+    for c in ["totlocsrc", "ira", "totexp"]:
+        if c in df.columns:
+            df[f"{c}_raw"] = df[c]
+            positive = df[c][df[c] > 0]
+            if len(positive) > 10:
+                q99 = np.exp(np.log(positive).quantile(0.99))
+                df[c] = np.where(df[c] > q99, q99, df[c])
+
+    if "cpi_2018" in df.columns:
+        deflator = df["cpi_2018"] / 100.0
+    else:
+        deflator = df["year"].map(
+            lambda y: CPI_FALLBACK.get(int(y), 100.0)) / 100.0
+
+    for c in ["totlocsrc", "ira", "totexp", "pubwelf", "educexp",
+              "healthexp", "govexp"]:
+        if c in df.columns:
+            df[f"{c}_real"] = df[c] / deflator
+
+    pre_years = [y - 1 for y in ELECTION_YEARS]
+    df["pbc_indicator"] = df["year"].isin(pre_years).astype(int)
+
+    print(f"[*] Fiscal panel: {len(df):,} LGU-years, "
+          f"{df['psgc10'].nunique():,} LGUs, "
+          f"years {int(df['year'].min())}–{int(df['year'].max())}")
+    if "lgutype" in df.columns:
+        print(df.groupby("lgutype")["psgc10"].nunique().to_string())
     return df
 
-# -----------------------------------------------------------------------------
-# 2. ESTIMATE ELASTICITIES (with adjusted intercept)
-# -----------------------------------------------------------------------------
-def estimate_elasticities(df):
+
+def load_election_panel(election_path: str, label: str) -> pd.DataFrame:
+    elec = pd.read_csv(election_path)
+    elec["psgc10"] = (elec["psgc10"].astype(str).str.strip()
+                      .str.replace(r"\.0$", "", regex=True).str.zfill(10))
+    for c in ["elecyr", "pi", "ENC_lt", "n_candidates"]:
+        if c in elec.columns:
+            elec[c] = pd.to_numeric(elec[c], errors="coerce")
+
+    elec = elec.dropna(subset=["psgc10", "elecyr"])
+    elec = elec.drop_duplicates(subset=["psgc10", "elecyr"])
+
+    # Normalize lgutype string
+    if "lgutype" in elec.columns:
+        elec["lgutype"] = elec["lgutype"].astype(str).str.strip().str.lower()
+    else:
+        elec["lgutype"] = "province"
+
+    print(f"\n[*] {label} panel: {len(elec):,} LGU-cycles, "
+          f"{elec['psgc10'].nunique():,} LGUs")
+    print(f"    by type:\n"
+          f"{elec.groupby('lgutype')['psgc10'].nunique().to_string()}")
+    print(f"    cycles: {sorted(elec['elecyr'].astype(int).unique())}")
+    return elec
+
+
+def build_regression_panel(fiscal: pd.DataFrame,
+                           elec: pd.DataFrame) -> pd.DataFrame:
+    fiscal_pre = fiscal.copy()
+    fiscal_pre["elecyr"] = fiscal_pre["year"] + 1
+    reg = elec.merge(
+        fiscal_pre, on=["psgc10", "elecyr"], how="inner",
+        suffixes=("", "_fiscal"),
+    )
+    print(f"\n[*] Regression panel: {len(reg):,} LGU-cycles, "
+          f"{reg['psgc10'].nunique()} LGUs, "
+          f"{reg['elecyr'].nunique()} cycles")
+    return reg
+
+
+# =============================================================================
+# 2. TWO-WAY FE VOTER ELASTICITY MODEL (parameterized by level)
+# =============================================================================
+def estimate_elasticities(reg: pd.DataFrame, level: str = "province") -> dict:
     """
-    Estimate coefficients using LGU fixed effects and compute an adjusted intercept
-    such that prediction at mean predictors equals mean_pi.
+    Two-way FE (unit + cycle) with unit-clustered SEs.
+    level = "province" | "city" | "municipality"
     """
-    model_df = df[['lgu', 'pi', 'pubwelf', 'educexp', 'healthexp', 'ENC_lt']].copy()
-    model_df = model_df.dropna()
-    if model_df.empty:
-        raise ValueError("Not enough data to estimate elasticities.")
-    
-    # Overall mean pi
-    mean_pi = model_df['pi'].mean()
-    
-    # Log transform
-    model_df['log_pub'] = np.log(model_df['pubwelf'] + 1)
-    model_df['log_edu'] = np.log(model_df['educexp'] + 1)
-    model_df['log_hea'] = np.log(model_df['healthexp'] + 1)
-    
-    # Compute means of predictors (for intercept adjustment)
-    mean_log_pub = model_df['log_pub'].mean()
-    mean_log_edu = model_df['log_edu'].mean()
-    mean_log_hea = model_df['log_hea'].mean()
-    mean_enc = model_df['ENC_lt'].mean()
-    
-    # Demean within LGU (fixed effects)
-    lgu_means = model_df.groupby('lgu').mean()
-    model_demeaned = model_df.set_index('lgu') - lgu_means
-    model_demeaned = model_demeaned.reset_index(drop=True)
-    
-    # OLS on demeaned data (no intercept)
-    X = model_demeaned[['log_pub', 'log_edu', 'log_hea', 'ENC_lt']]
-    y = model_demeaned['pi']
-    X = sm.add_constant(X)  # constant will be zero
-    model = sm.OLS(y, X, missing='drop').fit()
-    
-    b_pub = model.params.get('log_pub', 0.0)
-    b_edu = model.params.get('log_edu', 0.0)
-    b_hea = model.params.get('log_hea', 0.0)
-    b_enc = model.params.get('ENC_lt', 0.0)
-    
-    # Adjusted intercept: mean_pi - (b_pub*mean_log_pub + b_edu*mean_log_edu + b_hea*mean_log_hea + b_enc*mean_enc)
-    intercept_adj = mean_pi - (b_pub * mean_log_pub + b_edu * mean_log_edu + b_hea * mean_log_hea + b_enc * mean_enc)
-    
-    coefs = {
-        'b_pub': b_pub,
-        'b_edu': b_edu,
-        'b_hea': b_hea,
-        'b_enc': b_enc,
-        'resid_std': model.resid.std(),
-        'intercept': intercept_adj
+    # Level filter
+    if level == "province":
+        reg = reg[reg["lgutype"].str.contains("province", case=False, na=False)]
+    elif level == "city":
+        reg = reg[reg["lgutype"].str.contains("city", case=False, na=False)]
+    elif level == "municipality":
+        reg = reg[reg["lgutype"].str.contains("municipality",
+                                              case=False, na=False)]
+    else:
+        raise ValueError(f"Unknown level: {level}")
+
+    # Drop uncontested races (keep NaN for pre-2007 COMELEC rows)
+    if "n_candidates" in reg.columns:
+        reg = reg[reg["n_candidates"].isna() | (reg["n_candidates"] > 1)]
+
+    reg = reg[reg["pi"].notna() & (reg["pi"] > 0) & (reg["pi"] <= 1)].copy()
+
+    needed = ["lgu", "elecyr", "pi", "pubwelf_real", "educexp_real",
+              "healthexp_real", "ENC_lt"]
+    needed = [c for c in needed if c in reg.columns]
+    df = reg[needed].copy()
+    df = df.dropna(subset=["pi", "pubwelf_real", "educexp_real",
+                           "healthexp_real", "ENC_lt", "lgu", "elecyr"])
+    df = df[np.isfinite(df["ENC_lt"]) & (df["ENC_lt"] > 0)]
+
+    if len(df) < 30:
+        print(f"\n[!] {level}: only {len(df)} usable rows — skipping.")
+        return None
+
+    df["log_pub"] = np.log(df["pubwelf_real"] + 1)
+    df["log_edu"] = np.log(df["educexp_real"] + 1)
+    df["log_hea"] = np.log(df["healthexp_real"] + 1)
+    df["log_enc"] = np.log(df["ENC_lt"])
+
+    means = {k: float(df[k].mean()) for k in
+             ["log_pub", "log_edu", "log_hea", "log_enc"]}
+    mean_pi = float(df["pi"].mean())
+
+    # Two-way within transformation
+    cols = ["pi", "log_pub", "log_edu", "log_hea", "log_enc"]
+    lgu_means = df.groupby("lgu")[cols].transform("mean")
+    within = df[cols] - lgu_means
+    cycle_means = within.groupby(df["elecyr"]).transform("mean")
+    within = within - cycle_means
+
+    X = within[["log_pub", "log_edu", "log_hea", "log_enc"]].copy()
+    y = within["pi"].values
+    X = sm.add_constant(X, has_constant="skip")
+    groups = df["lgu"].values
+
+    try:
+        model = sm.OLS(y, X).fit(cov_type="cluster",
+                                 cov_kwds={"groups": groups})
+    except Exception:
+        model = sm.OLS(y, X).fit()
+
+    b = {k: float(model.params.get(k, 0.0))
+         for k in ["log_pub", "log_edu", "log_hea", "log_enc"]}
+    intercept_adj = mean_pi - sum(b[k] * means[k] for k in b)
+
+    ss_res = float(np.sum((y - model.fittedvalues) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    within_r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+    result = {
+        "coefficients": b,
+        "std_errors": {k: float(v) for k, v in model.bse.items()},
+        "p_values": {k: float(v) for k, v in model.pvalues.items()},
+        "n_obs": int(model.nobs),
+        "n_lgu": int(df["lgu"].nunique()),
+        "n_cycles": int(df["elecyr"].nunique()),
+        "within_r2": float(within_r2),
+        "f_stat": float(model.fvalue) if model.fvalue is not None else np.nan,
+        "resid_std": float(np.std(model.resid, ddof=1)),
+        "intercept": float(intercept_adj),
+        "mean_pi": mean_pi,
+        "mean_predictors": means,
+        "level": level,
     }
-    print("[*] Estimated elasticities:", coefs)
-    return coefs
 
-# -----------------------------------------------------------------------------
-# 3. MONTE CARLO SIMULATION (with adjusted intercept & cumulative tracker)
-# -----------------------------------------------------------------------------
-def run_empirical_monte_carlo(df, elasticities, n_simulations=10000, seed=42):
-    np.random.seed(seed)
-    
-    # Extract revenue moments
-    mean_loc = df['totlocsrc'].mean() if 'totlocsrc' in df.columns else 150.0
-    std_loc = df['totlocsrc'].std() if 'totlocsrc' in df.columns else 35.0
-    mean_ira = df['ira'].mean() if 'ira' in df.columns else 450.0
-    std_ira = df['ira'].std() if 'ira' in df.columns else 40.0
-    
-    rev_corr = df[['totlocsrc', 'ira']].corr().iloc[0, 1] if {'totlocsrc', 'ira'}.issubset(df.columns) else 0.45
-    mean_enc = df['ENC_lt'].mean() if 'ENC_lt' in df.columns and not df['ENC_lt'].isna().all() else 2.5
-    
-    # Fallback
-    mean_loc = 150.0 if np.isnan(mean_loc) else mean_loc
-    std_loc = 35.0 if np.isnan(std_loc) else std_loc
-    mean_ira = 450.0 if np.isnan(mean_ira) else mean_ira
-    std_ira = 40.0 if np.isnan(std_ira) else std_ira
-    rev_corr = 0.45 if np.isnan(rev_corr) else rev_corr
-    mean_enc = 2.5 if np.isnan(mean_enc) else mean_enc
+    print(f"\n[*] Two-way FE ({level}):")
+    print(f"    N = {result['n_obs']}, "
+          f"LGUs = {result['n_lgu']}, "
+          f"cycles = {result['n_cycles']}, "
+          f"within-R² = {within_r2:.4f}")
+    for k in ["log_pub", "log_edu", "log_hea", "log_enc"]:
+        print(f"    {k:10s}: b={b[k]:+.6f}  "
+              f"se={result['std_errors'].get(k, np.nan):.6f}  "
+              f"p={result['p_values'].get(k, np.nan):.4f}")
+    return result
 
-    # Lognormal parameters
-    def norm_to_lognorm(mean, std):
-        var = std ** 2
-        sig2 = np.log(1 + (var / (mean ** 2)))
-        mu = np.log(mean) - (sig2 / 2)
-        return mu, np.sqrt(sig2)
 
-    mu_loc, sig_loc = norm_to_lognorm(mean_loc, std_loc)
-    mu_ira, sig_ira = norm_to_lognorm(mean_ira, std_ira)
+# =============================================================================
+# 3. LOGNORMAL CALIBRATION (parameterized by level)
+# =============================================================================
+def calibrate_lognormal(fiscal: pd.DataFrame, level: str) -> dict:
+    if level == "province":
+        sub = fiscal[fiscal["lgutype"].str.contains("province",
+                                                    case=False, na=False)]
+    elif level == "city":
+        sub = fiscal[fiscal["lgutype"].str.contains("city",
+                                                    case=False, na=False)]
+    elif level == "municipality":
+        sub = fiscal[fiscal["lgutype"].str.contains("municipality",
+                                                    case=False, na=False)]
+    else:
+        raise ValueError(f"Unknown level: {level}")
 
-    # Cholesky for correlation
-    cov_matrix = np.array([
-        [sig_loc**2, rev_corr * sig_loc * sig_ira],
-        [rev_corr * sig_loc * sig_ira, sig_ira**2]
+    loc_col = "totlocsrc_real" if "totlocsrc_real" in sub.columns \
+        else "totlocsrc"
+    ira_col = "ira_real" if "ira_real" in sub.columns else "ira"
+
+    loc = sub[loc_col].dropna()
+    ira = sub[ira_col].dropna()
+    joint = sub[[loc_col, ira_col]].dropna()
+
+    mean_loc, std_loc = float(loc.mean()), float(loc.std())
+    mean_ira, std_ira = float(ira.mean()), float(ira.std())
+    rho = float(joint.corr().iloc[0, 1]) if len(joint) > 2 else REV_CORR_DEFAULT
+
+    def to_lognormal(m, s):
+        var = s ** 2
+        sig2 = np.log(1 + var / (m ** 2))
+        return np.log(m) - sig2 / 2, np.sqrt(sig2)
+
+    mu_loc, sig_loc = to_lognormal(mean_loc, std_loc)
+    mu_ira, sig_ira = to_lognormal(mean_ira, std_ira)
+    cov = np.array([
+        [sig_loc ** 2, rho * sig_loc * sig_ira],
+        [rho * sig_loc * sig_ira, sig_ira ** 2],
     ])
-    L = np.linalg.cholesky(cov_matrix)
-    uncorrelated = np.random.normal(size=(2, n_simulations))
-    correlated = np.dot(L, uncorrelated)
 
+    cal = {
+        "mean_loc": mean_loc, "std_loc": std_loc,
+        "mean_ira": mean_ira, "std_ira": std_ira, "rho": rho,
+        "mu": np.array([mu_loc, mu_ira]), "Sigma": cov,
+        "mu_loc": mu_loc, "sig_loc": sig_loc,
+        "mu_ira": mu_ira, "sig_ira": sig_ira,
+        "baseline_budget": mean_loc + mean_ira,
+        "level": level,
+    }
+
+    print(f"\n[*] Calibration ({level}): "
+          f"mean_loc={mean_loc:,.0f}, mean_ira={mean_ira:,.0f}, "
+          f"ρ={rho:.3f}, baseline={mean_loc+mean_ira:,.0f} PHP M")
+    return cal
+
+
+# =============================================================================
+# 4. MONTE CARLO SIMULATION
+# =============================================================================
+def run_monte_carlo(elasticities: dict, cal: dict,
+                    n_sim: int = N_SIM, n_years: int = N_YEARS,
+                    seed: int = RANDOM_SEED,
+                    threshold: float = INSOLVENCY_THRESHOLD) -> dict:
+    rng = np.random.default_rng(seed)
+
+    mu_loc, sig_loc = cal["mu_loc"], cal["sig_loc"]
+    mu_ira, sig_ira = cal["mu_ira"], cal["sig_ira"]
+    rho = cal["rho"]
+    baseline_budget = cal["baseline_budget"]
+
+    cov = np.array([
+        [sig_loc ** 2, rho * sig_loc * sig_ira],
+        [rho * sig_loc * sig_ira, sig_ira ** 2],
+    ])
+    L = np.linalg.cholesky(cov)
+
+    # 1-year income draws
+    z = rng.standard_normal(size=(2, n_sim))
+    correlated = L @ z
     sim_loc = np.exp(mu_loc + correlated[0, :])
     sim_ira = np.exp(mu_ira + correlated[1, :])
     total_income = sim_loc + sim_ira
-    baseline_budget = mean_loc + mean_ira
 
-    # Unpack elasticities
-    b_pub = elasticities['b_pub']
-    b_edu = elasticities['b_edu']
-    b_hea = elasticities['b_hea']
-    b_enc = elasticities['b_enc']
-    resid_std = elasticities['resid_std']
-    intercept = elasticities['intercept']   # adjusted intercept
+    # 10-year income paths (shared across scenarios)
+    income_paths = np.zeros((n_sim, n_years))
+    for i in range(n_sim):
+        z_y = rng.standard_normal(size=(2, n_years))
+        corr_y = L @ z_y
+        income_paths[i] = (np.exp(mu_loc + corr_y[0, :])
+                           + np.exp(mu_ira + corr_y[1, :]))
 
-    # Scenario A: Clientelistic Surge
-    surge_A = np.random.uniform(1.15, 1.30, n_simulations)
+    surge_A = rng.uniform(1.15, 1.30, n_sim)
+    surge_B = rng.uniform(0.95, 1.02, n_sim)
+    surge_C = surge_A.copy()
+
+    comp_A = dict(pub=0.35, admin=0.35, edu=0.15, health=0.15)
+    comp_B = dict(pub=0.10, admin=0.25, edu=0.35, health=0.30)
+    comp_C = comp_B
+
+    def compose(totexp, comp):
+        return (totexp * comp["pub"], totexp * comp["admin"],
+                totexp * comp["edu"], totexp * comp["health"])
+
     totexp_A = baseline_budget * surge_A
-    pubwelf_A = totexp_A * 0.35
-    govexp_A = totexp_A * 0.35
-    educexp_A = totexp_A * 0.15
-    healthexp_A = totexp_A * 0.15
-
-    # Scenario B: Balanced Portfolio
-    surge_B = np.random.uniform(0.95, 1.02, n_simulations)
     totexp_B = baseline_budget * surge_B
-    pubwelf_B = totexp_B * 0.10
-    govexp_B = totexp_B * 0.25
-    educexp_B = totexp_B * 0.35
-    healthexp_B = totexp_B * 0.30
+    totexp_C = baseline_budget * surge_C
 
-    # Voter model using adjusted intercept + residual noise
-    def calc_pi(pub, edu, hea, enc):
-        log_pub = np.log(pub + 1)
-        log_edu = np.log(edu + 1)
-        log_hea = np.log(hea + 1)
+    pub_A, _, edu_A, hea_A = compose(totexp_A, comp_A)
+    pub_B, _, edu_B, hea_B = compose(totexp_B, comp_B)
+    pub_C, _, edu_C, hea_C = compose(totexp_C, comp_C)
+
+    b_pub = elasticities["coefficients"]["log_pub"]
+    b_edu = elasticities["coefficients"]["log_edu"]
+    b_hea = elasticities["coefficients"]["log_hea"]
+    b_enc = elasticities["coefficients"]["log_enc"]
+    intercept = elasticities["intercept"]
+    resid_std = elasticities["resid_std"]
+    mean_log_enc = elasticities["mean_predictors"]["log_enc"]
+
+    def simulate_pi(pub, edu, hea):
         pi_hat = (intercept
-                  + b_pub * log_pub
-                  + b_edu * log_edu
-                  + b_hea * log_hea
-                  + b_enc * enc)
-        noise = np.random.normal(0, resid_std, len(pub))
+                  + b_pub * np.log(pub + 1)
+                  + b_edu * np.log(edu + 1)
+                  + b_hea * np.log(hea + 1)
+                  + b_enc * mean_log_enc)
+        noise = rng.normal(0, resid_std, size=len(pub))
         return np.clip(pi_hat + noise, 0.0, 1.0)
 
-    pi_A = calc_pi(pubwelf_A, educexp_A, healthexp_A, mean_enc)
-    pi_B = calc_pi(pubwelf_B, educexp_B, healthexp_B, mean_enc)
+    pi_A = simulate_pi(pub_A, edu_A, hea_A)
+    pi_B = simulate_pi(pub_B, edu_B, hea_B)
+    pi_C = simulate_pi(pub_C, edu_C, hea_C)
 
-    # Single-period deficits
+    def insolv_flag(totexp):
+        return ((totexp - total_income) / total_income) > threshold
+
+    insolvent_A_1y = insolv_flag(totexp_A)
+    insolvent_B_1y = insolv_flag(totexp_B)
+    insolvent_C_1y = insolv_flag(totexp_C)
+
     deficit_A = totexp_A - total_income
     deficit_B = totexp_B - total_income
-    insolvent_A = (deficit_A / total_income) > 0.05
-    insolvent_B = (deficit_B / total_income) > 0.05
+    deficit_C = totexp_C - total_income
 
-    # ---- CUMULATIVE DEFICIT TRACKER (10 years) for both scenarios ----
-    n_years = 10
-    cum_def_A = np.zeros(n_simulations)
-    cum_inc_A = np.zeros(n_simulations)
-    cum_def_B = np.zeros(n_simulations)
-    cum_inc_B = np.zeros(n_simulations)
+    def sim_cumulative(totexp_vec, income_paths, label, thresh):
+        n = totexp_vec.shape[0]
+        cum_def = np.zeros(n)
+        cum_ratio = np.zeros(n)
+        n_insolv_years = np.zeros(n, dtype=int)
+        for i in range(n):
+            d_y = totexp_vec[i] - income_paths[i]
+            r_y = d_y / income_paths[i]
+            cum_def[i] = d_y.sum()
+            cum_ratio[i] = d_y.sum() / income_paths[i].sum()
+            n_insolv_years[i] = int(np.sum(r_y > thresh))
+        return {f"cum_def_{label}": cum_def,
+                f"cum_ratio_{label}": cum_ratio,
+                f"n_insolv_years_{label}": n_insolv_years}
 
-    for i in range(n_simulations):
-        # Simulate 10 years of income (same for both)
-        inc_years = np.exp(mu_loc + np.random.normal(0, sig_loc, n_years)) + \
-                    np.exp(mu_ira + np.random.normal(0, sig_ira, n_years))
-        # Scenario A: constant surge_A[i]
-        exp_A = baseline_budget * surge_A[i]
-        cum_def_A[i] = np.sum(exp_A - inc_years)
-        cum_inc_A[i] = np.sum(inc_years)
-        # Scenario B: constant surge_B[i]
-        exp_B = baseline_budget * surge_B[i]
-        cum_def_B[i] = np.sum(exp_B - inc_years)
-        cum_inc_B[i] = np.sum(inc_years)
+    paths_A = sim_cumulative(totexp_A, income_paths, "A", threshold)
+    paths_B = sim_cumulative(totexp_B, income_paths, "B", threshold)
+    paths_C = sim_cumulative(totexp_C, income_paths, "C", threshold)
 
-    cum_insolvent_A = (cum_def_A / cum_inc_A) > 0.05
-    cum_insolvent_B = (cum_def_B / cum_inc_B) > 0.05
+    def mc_se_prob(p):
+        return float(np.sqrt(p * (1 - p) / n_sim))
 
-    sim_data = {
-        'totexp_A': totexp_A, 'totexp_B': totexp_B,
-        'deficit_A': deficit_A, 'deficit_B': deficit_B,
-        'insolvent_A': insolvent_A, 'insolvent_B': insolvent_B,
-        'pi_A': pi_A, 'pi_B': pi_B,
-        'sim_loc': sim_loc, 'sim_ira': sim_ira,
-        'total_income': total_income,
-        'surge_A': surge_A,
-        'surge_B': surge_B,
-        'cum_def_A': cum_def_A, 'cum_inc_A': cum_inc_A,
-        'cum_insolvent_A': cum_insolvent_A,
-        'cum_def_B': cum_def_B, 'cum_inc_B': cum_inc_B,
-        'cum_insolvent_B': cum_insolvent_B,
+    def mc_se_mean(x):
+        return float(np.std(x, ddof=1) / np.sqrt(n_sim))
+
+    results = {
+        "sim_loc": sim_loc, "sim_ira": sim_ira, "total_income": total_income,
+        "surge_A": surge_A, "surge_B": surge_B, "surge_C": surge_C,
+        "totexp_A": totexp_A, "totexp_B": totexp_B, "totexp_C": totexp_C,
+        "deficit_A": deficit_A, "deficit_B": deficit_B, "deficit_C": deficit_C,
+        "pi_A": pi_A, "pi_B": pi_B, "pi_C": pi_C,
+        "insolvent_A_1y": insolvent_A_1y,
+        "insolvent_B_1y": insolvent_B_1y,
+        "insolvent_C_1y": insolvent_C_1y,
+        "mc_se": {
+            "insolv_A_1y": mc_se_prob(insolvent_A_1y.mean()),
+            "insolv_B_1y": mc_se_prob(insolvent_B_1y.mean()),
+            "insolv_C_1y": mc_se_prob(insolvent_C_1y.mean()),
+            "n_insolv_A_10y": mc_se_mean(paths_A["n_insolv_years_A"]),
+            "n_insolv_B_10y": mc_se_mean(paths_B["n_insolv_years_B"]),
+            "n_insolv_C_10y": mc_se_mean(paths_C["n_insolv_years_C"]),
+            "cum_ratio_A_10y": mc_se_mean(paths_A["cum_ratio_A"]),
+            "cum_ratio_B_10y": mc_se_mean(paths_B["cum_ratio_B"]),
+            "cum_ratio_C_10y": mc_se_mean(paths_C["cum_ratio_C"]),
+            "mean_deficit_A": mc_se_mean(deficit_A),
+            "mean_deficit_B": mc_se_mean(deficit_B),
+            "mean_deficit_C": mc_se_mean(deficit_C),
+            "mean_pi_A": mc_se_mean(pi_A),
+            "mean_pi_B": mc_se_mean(pi_B),
+            "mean_pi_C": mc_se_mean(pi_C),
+        },
     }
-    return sim_data
+    results.update(paths_A)
+    results.update(paths_B)
+    results.update(paths_C)
+    return results
 
-# -----------------------------------------------------------------------------
-# 4. VISUALIZATION GENERATOR (7 figures)
-# -----------------------------------------------------------------------------
-def generate_visualizations(df, sim, elasticities):
-    # ---- Figure 1: Empirical PBC ----
-    generate_figure1(df, output_dir=OUTPUT_DIR)
 
-    # ---- Figure 2: Deficit distribution & VaR ----
-    plt.figure(figsize=(9, 5))
-    sns.kdeplot(sim['deficit_A'], fill=True, color='crimson', label='Scenario A', alpha=0.4)
-    sns.kdeplot(sim['deficit_B'], fill=True, color='teal', label='Scenario B', alpha=0.4)
-    var_95_A = np.percentile(sim['deficit_A'], 95)
-    var_95_B = np.percentile(sim['deficit_B'], 95)
-    plt.axvline(var_95_A, color='darkred', linestyle='--', linewidth=2, label=f'95% VaR A: {var_95_A:.1f}M')
-    plt.axvline(var_95_B, color='darkgreen', linestyle='--', linewidth=2, label=f'95% VaR B: {var_95_B:.1f}M')
-    plt.axvline(0, color='black', linestyle=':', label='Balanced Budget')
-    plt.title("Deficit Distributions & Tail Risk")
-    plt.xlabel("Fiscal Deficit (PHP M)")
-    plt.ylabel("Density")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "fig2_deficit_var_density.png"), dpi=300)
-    plt.close()
+# =============================================================================
+# 5. THREE-LEVEL TABLES
+# =============================================================================
+def build_three_level_elasticity_table(results: dict) -> pd.DataFrame:
+    rows = []
+    for label, key in [
+        ("ln(pub welfare + 1)", "log_pub"),
+        ("ln(education + 1)",   "log_edu"),
+        ("ln(health + 1)",      "log_hea"),
+        ("ln(ENC)",             "log_enc"),
+    ]:
+        row = {"Predictor": label}
+        for lvl in ["province", "city", "municipality"]:
+            e = results.get(lvl)
+            if e is None:
+                row[f"{lvl.title()} β"] = "—"
+                row[f"{lvl.title()} p"] = "—"
+                continue
+            b = e["coefficients"][key]
+            p = e["p_values"].get(key, np.nan)
+            row[f"{lvl.title()} β"] = f"{b:+.4f}"
+            row[f"{lvl.title()} p"] = f"{p:.3f}"
+        rows.append(row)
 
-    # ---- Figure 3: Trade-off frontier (using empirical elasticities) ----
-    surges = np.linspace(1.0, 1.45, 20)
-    vote_shares = []
-    insolvency_rates = []
-    base_budget = sim['total_income'].mean()
-    # Use empirical coefficients from elasticities (including adjusted intercept)
-    b_pub = elasticities['b_pub']
-    b_edu = elasticities['b_edu']
-    b_hea = elasticities['b_hea']
-    b_enc = elasticities['b_enc']
-    intercept = elasticities['intercept']
+    for summary_label, summary_key, formatter in [
+        ("Within-R²", "within_r2", lambda x: f"{x:.3f}"),
+        ("N (LGU-cycle)", "n_obs", lambda x: f"{x}"),
+        ("N (LGUs)", "n_lgu", lambda x: f"{x}"),
+        ("N (cycles)", "n_cycles", lambda x: f"{x}"),
+    ]:
+        row = {"Predictor": summary_label}
+        for lvl in ["province", "city", "municipality"]:
+            e = results.get(lvl)
+            row[f"{lvl.title()} β"] = (
+                formatter(e[summary_key]) if e else "—")
+            row[f"{lvl.title()} p"] = ""
+        rows.append(row)
+    return pd.DataFrame(rows)
 
-    for s in surges:
-        tot_exp = base_budget * s
-        pub = tot_exp * 0.35
-        edu = tot_exp * 0.15
-        hea = tot_exp * 0.15
-        # Compute vote share using the same model
-        pi_hat = intercept + b_pub * np.log(pub + 1) + b_edu * np.log(edu + 1) + b_hea * np.log(hea + 1) + b_enc * 2.5
-        pi = np.clip(pi_hat, 0, 1)
-        # Insolvency risk
-        defic = tot_exp - sim['total_income']
-        insolv = np.mean((defic / sim['total_income']) > 0.05)
-        vote_shares.append(pi)
-        insolvency_rates.append(insolv * 100)
 
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-    ax1.plot(surges, vote_shares, 'b-o', label='Vote Share')
-    ax1.set_xlabel('Surge Multiplier')
-    ax1.set_ylabel('Vote Share', color='b')
-    ax2 = ax1.twinx()
-    ax2.plot(surges, insolvency_rates, 'r--s', label='Insolvency Risk')
-    ax2.set_ylabel('Insolvency Probability (%)', color='r')
-    plt.title("Trade-off: Vote Share vs Insolvency Risk (Empirical Elasticities)")
+def build_three_level_summary_table(sims: dict) -> pd.DataFrame:
+    def pct(x):
+        return 100 * float(np.mean(x))
+
+    rows = []
+    for label, key in [
+        ("Expected total expenditure (PHP M)", "totexp"),
+        ("Expected deficit (PHP M)",           "deficit"),
+        ("1-year insolvency (%)",              "insolvent_1y"),
+        ("Mean insolvent years (of 10)",       "n_insolv_years"),
+        ("95% VaR 10-yr cum. deficit/income",  "cum_ratio_VaR"),
+        ("Mean vote share",                    "pi"),
+    ]:
+        row = {"Metric": label}
+        for scen in ["A", "B"]:
+            for lvl in ["province", "city", "municipality"]:
+                sim = sims.get(lvl)
+                col = f"{lvl[:3].title()}-{scen}"
+                if sim is None:
+                    row[col] = "—"
+                    continue
+                if key == "totexp":
+                    row[col] = f"{sim[f'totexp_{scen}'].mean():,.0f}"
+                elif key == "deficit":
+                    row[col] = f"{sim[f'deficit_{scen}'].mean():,.0f}"
+                elif key == "insolvent_1y":
+                    row[col] = f"{pct(sim[f'insolvent_{scen}_1y']):.1f}"
+                elif key == "n_insolv_years":
+                    row[col] = f"{sim[f'n_insolv_years_{scen}'].mean():.2f}"
+                elif key == "cum_ratio_VaR":
+                    row[col] = f"{np.percentile(sim[f'cum_ratio_{scen}'], 95):.3f}"
+                elif key == "pi":
+                    row[col] = f"{sim[f'pi_{scen}'].mean():.3f}"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 6. FIGURES
+# =============================================================================
+def fig1_empirical_pbc(fiscal: pd.DataFrame, outdir: str) -> None:
+    spending_map = {"pubwelf": "Public welfare", "govexp": "General admin.",
+                    "educexp": "Education", "healthexp": "Health"}
+    cols = [c for c in spending_map if c in fiscal.columns]
+    types = [("Province", "Provinces"), ("City", "Cities"),
+             ("Municipality", "Municipalities")]
+    colors = ["#d9534f", "#f0ad4e", "#0275d8", "#5cb85c"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.6))
+    for ax, (t, label) in zip(axes, types):
+        sub = fiscal[fiscal["lgutype"].str.contains(t, case=False, na=False)]
+        if sub.empty:
+            ax.set_title(f"{label}: no data"); ax.set_xticks([]); continue
+        plot_cols = []
+        for c in cols:
+            c_real = f"{c}_real"
+            sub = sub.copy()
+            sub[f"{c}_plot"] = sub[c_real] / 1e6 if c_real in sub.columns \
+                else sub[c]
+            plot_cols.append(f"{c}_plot")
+        summ = sub.groupby("pbc_indicator")[plot_cols].mean()
+        summ.index = summ.index.map({0: "Off-election", 1: "Pre-election"})
+        summ.plot(kind="bar", ax=ax, width=0.7, edgecolor="black",
+                  linewidth=0.4, color=colors[:len(plot_cols)])
+        ax.set_title(f"{label} (N = {sub['psgc10'].nunique()})")
+        ax.set_xlabel("Electoral cycle phase")
+        ax.set_ylabel("Mean expenditure (PHP M)")
+        ax.set_xticklabels(summ.index, rotation=0)
+        ax.legend([spending_map[c] for c in cols], frameon=False, fontsize=8)
+    fig.suptitle("Figure 1. Empirical political budget cycle by LGU level")
     fig.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "fig3_patronage_tradeoff_frontier.png"), dpi=300)
-    plt.close()
+    fig.savefig(os.path.join(outdir, "fig1_empirical_pbc.png"))
+    plt.close(fig)
 
-    # ---- Figure 4: Heatmap ----
+
+def fig2_tradeoff(sim, elasticities, cal, outdir):
+    base_budget = cal["baseline_budget"]
+    b = elasticities["coefficients"]
+    intercept = elasticities["intercept"]
+    mean_log_enc = elasticities["mean_predictors"]["log_enc"]
+
+    surges = np.linspace(1.00, 1.45, 25)
+    pi_vals, insolv_vals = [], []
+    for s in surges:
+        totexp = base_budget * s
+        pub, edu, hea = totexp * 0.35, totexp * 0.15, totexp * 0.15
+        pi_hat = (intercept + b["log_pub"] * np.log(pub + 1)
+                  + b["log_edu"] * np.log(edu + 1)
+                  + b["log_hea"] * np.log(hea + 1)
+                  + b["log_enc"] * mean_log_enc)
+        pi_vals.append(float(np.clip(pi_hat, 0, 1)))
+        deficit = totexp - sim["total_income"]
+        insolv_vals.append(100 * float(np.mean(
+            (deficit / sim["total_income"]) > INSOLVENCY_THRESHOLD)))
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
+    axes[0].plot(surges, pi_vals, "b-o", markersize=4)
+    axes[0].set_xlabel("Surge multiplier")
+    axes[0].set_ylabel("Simulated vote share")
+    axes[0].set_title("(a) Vote share vs surge")
+    axes[0].grid(True, linestyle="--", alpha=0.5)
+    axes[0].ticklabel_format(axis="y", style="plain", useOffset=False)
+    axes[1].plot(surges, insolv_vals, "r--s", markersize=4)
+    axes[1].set_xlabel("Surge multiplier")
+    axes[1].set_ylabel("Insolvency probability (%)")
+    axes[1].set_title("(b) Insolvency risk vs surge")
+    axes[1].grid(True, linestyle="--", alpha=0.5)
+    fig.suptitle(f"Figure 2. Vote-share and insolvency trade-off "
+                 f"({cal['level'].title()})")
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, f"fig2_tradeoff_{cal['level']}.png"))
+    plt.close(fig)
+
+
+def fig3_heatmap(sim, cal, outdir):
+    base_budget = cal["baseline_budget"]
     enc_grid = np.linspace(1.0, 4.0, 5)
-    surge_grid = np.linspace(1.0, 1.35, 5)
-    heatmap_matrix = np.zeros((len(enc_grid), len(surge_grid)))
-    for i, enc in enumerate(enc_grid):
+    surge_grid = np.linspace(1.00, 1.35, 5)
+    M = np.zeros((len(enc_grid), len(surge_grid)))
+    for i, _ in enumerate(enc_grid):
         for j, s in enumerate(surge_grid):
-            exp = base_budget * s
-            defic = exp - sim['total_income']
-            insolv_rate = np.mean((defic / sim['total_income']) > 0.05)
-            heatmap_matrix[i, j] = insolv_rate * 100
-    plt.figure(figsize=(7, 5))
-    sns.heatmap(heatmap_matrix, annot=True, fmt=".1f", cmap="YlOrRd",
-                xticklabels=[f"{s:.2f}x" for s in surge_grid],
-                yticklabels=[f"{e:.1f}" for e in enc_grid])
-    plt.title("Insolvency Risk (%) by ENC & Surge")
-    plt.xlabel("Surge Multiplier")
-    plt.ylabel("ENC_lt")
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "fig4_competition_risk_heatmap.png"), dpi=300)
-    plt.close()
+            deficit = base_budget * s - sim["total_income"]
+            M[i, j] = 100 * float(np.mean(
+                (deficit / sim["total_income"]) > INSOLVENCY_THRESHOLD))
+    fig, ax = plt.subplots(figsize=(7, 5))
+    sns.heatmap(M, annot=True, fmt=".1f", cmap="YlOrRd",
+                xticklabels=[f"{s:.2f}×" for s in surge_grid],
+                yticklabels=[f"{e:.1f}" for e in enc_grid],
+                ax=ax, cbar_kws={"label": "Insolvency probability (%)"})
+    ax.set_title(f"Figure 3. Insolvency risk (%) — {cal['level'].title()}")
+    ax.set_xlabel("Surge multiplier")
+    ax.set_ylabel("Effective number of candidates (ENC)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, f"fig3_heatmap_{cal['level']}.png"))
+    plt.close(fig)
 
-    # ---- Figure 5: Revenue distributions ----
-    plt.figure(figsize=(8, 5))
-    sns.histplot(sim['sim_loc'], color='blue', label='Local Revenue', kde=True, stat="density", bins=30, alpha=0.3)
-    sns.histplot(sim['sim_ira'], color='green', label='IRA', kde=True, stat="density", bins=30, alpha=0.3)
-    plt.title("Lognormal Revenue Fits")
-    plt.xlabel("Revenue (PHP M)")
-    plt.ylabel("Density")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "fig5_revenue_distributions.png"), dpi=300)
-    plt.close()
 
-    # ---- Figure 6: 10-year stochastic trajectories ----
-    n_years = 10
-    n_paths = 50
-    stochastic_paths_A = np.zeros((n_paths, n_years))
-    for i in range(n_paths):
-        path_inc = np.random.normal(base_budget, sim['total_income'].std(), n_years)
-        path_exp = base_budget * np.random.uniform(1.15, 1.25, n_years)
-        stochastic_paths_A[i, :] = np.cumsum(path_exp - path_inc)
-    plt.figure(figsize=(8, 5))
-    for i in range(n_paths):
-        plt.plot(range(1, n_years+1), stochastic_paths_A[i, :], color='crimson', alpha=0.25)
-    plt.plot(range(1, n_years+1), np.mean(stochastic_paths_A, axis=0), 'k--', linewidth=3, label='Mean Deficit')
-    plt.axhline(0, color='blue', linestyle=':', label='Zero')
-    plt.title("10-Year Cumulative Deficit (Clientelistic Path)")
-    plt.xlabel("Years")
-    plt.ylabel("Cumulative Deficit (PHP M)")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "fig6_10yr_stochastic_trajectories.png"), dpi=300)
-    plt.close()
+def fig4_deficit_density(sim, cal, outdir):
+    fig, ax = plt.subplots(figsize=(9, 5))
+    sns.kdeplot(sim["deficit_A"], fill=True, color="crimson",
+                label="Scenario A", alpha=0.35, ax=ax)
+    sns.kdeplot(sim["deficit_B"], fill=True, color="teal",
+                label="Scenario B", alpha=0.35, ax=ax)
+    varA = float(np.percentile(sim["deficit_A"], 95))
+    varB = float(np.percentile(sim["deficit_B"], 95))
+    ax.axvline(varA, color="darkred", linestyle="--", linewidth=1.6,
+               label=f"95% VaR A: {varA:,.1f} M")
+    ax.axvline(varB, color="darkgreen", linestyle="--", linewidth=1.6,
+               label=f"95% VaR B: {varB:,.1f} M")
+    ax.axvline(0, color="black", linestyle=":", linewidth=1.0,
+               label="Balanced budget")
+    ax.set_title(f"Figure 4. Deficit distributions — {cal['level'].title()}")
+    ax.set_xlabel("Fiscal deficit (PHP M, constant 2018)")
+    ax.set_ylabel("Density")
+    ax.legend(frameon=False, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, f"fig4_deficit_var_{cal['level']}.png"))
+    plt.close(fig)
 
-    # ---- Figure 7: DIAGNOSTIC PLOTS ----
-    fig7, axes = plt.subplots(2, 2, figsize=(12, 10))
-    axes[0,0].hist(sim['total_income'], bins=50, color='steelblue', alpha=0.7, edgecolor='black')
-    axes[0,0].set_title("Simulated Total Income Distribution")
-    axes[0,0].set_xlabel("Income (PHP M)")
-    axes[0,0].set_ylabel("Frequency")
 
-    ratio_A = sim['deficit_A'] / sim['total_income']
-    axes[0,1].hist(ratio_A, bins=50, color='crimson', alpha=0.7, edgecolor='black')
-    axes[0,1].axvline(0, color='black', linestyle='--', label='Balanced')
-    axes[0,1].axvline(0.05, color='red', linestyle='--', label='5% Threshold')
-    axes[0,1].set_title("Deficit / Income Ratio (Scenario A)")
-    axes[0,1].set_xlabel("Ratio")
-    axes[0,1].set_ylabel("Frequency")
-    axes[0,1].legend()
-
-    axes[1,0].scatter(sim['pi_A'], sim['deficit_A'] / sim['total_income'], alpha=0.3, color='purple')
-    axes[1,0].set_xlabel("Vote Share (π)")
-    axes[1,0].set_ylabel("Deficit / Income Ratio")
-    axes[1,0].set_title("Vote Share vs Fiscal Risk (Scenario A)")
-
-    axes[1,1].scatter(sim['total_income'], sim['deficit_A'], alpha=0.3, color='darkgreen')
-    axes[1,1].set_xlabel("Total Income (PHP M)")
-    axes[1,1].set_ylabel("Deficit (PHP M)")
-    axes[1,1].axhline(0, color='black', linestyle='--')
-    axes[1,1].set_title("Deficit vs Income")
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(OUTPUT_DIR, "fig7_diagnostics.png"), dpi=300)
-    plt.close()
-    print("[✓] Diagnostic plots saved as fig7_diagnostics.png")
-
-# -----------------------------------------------------------------------------
-# 5. Figure 1 generator
-# -----------------------------------------------------------------------------
-def generate_figure1(df, output_dir="outputs"):
-    os.makedirs(output_dir, exist_ok=True)
-    if 'yearb4elec' in df.columns:
-        pbc_col = 'yearb4elec'
-    elif 'yrb4' in df.columns:
-        pbc_col = 'yrb4'
-    elif 'elecyr' in df.columns and 'year' in df.columns:
-        df['pbc_indicator'] = ((df['year'] + 1) == df['elecyr']).astype(int)
-        pbc_col = 'pbc_indicator'
-    elif 'year' in df.columns:
-        election_years = [1992, 1995, 1998, 2001, 2004, 2007, 2010, 2013, 2016, 2019, 2022]
-        df['pbc_indicator'] = df['year'].isin([y - 1 for y in election_years]).astype(int)
-        pbc_col = 'pbc_indicator'
-    else:
-        df['pbc_indicator'] = 0
-        pbc_col = 'pbc_indicator'
-        print("[!] No year column; assuming no pre-election years.")
-    
-    spending_map = {
-        'pubwelf': 'Public Welfare',
-        'govexp': 'General Admin',
-        'educexp': 'Education',
-        'healthexp': 'Health'
-    }
-    available_cols = [c for c in spending_map.keys() if c in df.columns]
-    if not available_cols:
-        print("[!] No expenditure columns; creating placeholder.")
-        fig, ax = plt.subplots(figsize=(9,5.5), dpi=300)
-        ax.text(0.5, 0.5, "No expenditure data", ha='center', va='center')
-        ax.set_title("Empirical PBC – Data Missing")
-        fig.tight_layout()
-        fig.savefig(os.path.join(output_dir, "fig1_empirical_pbc.png"))
-        plt.close(fig)
+def fig5_revenue_fits(fiscal_level, cal, outdir):
+    loc_col = "totlocsrc_raw" if "totlocsrc_raw" in fiscal_level.columns \
+        else "totlocsrc"
+    ira_col = "ira_raw" if "ira_raw" in fiscal_level.columns else "ira"
+    loc = fiscal_level[loc_col].dropna().values
+    ira = fiscal_level[ira_col].dropna().values
+    if len(loc) < 5 or len(ira) < 5:
         return
-    
-    for col in available_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    
-    pbc_summary = df.groupby(pbc_col)[available_cols].mean().reset_index()
-    pbc_summary[pbc_col] = pbc_summary[pbc_col].map({0: 'Off-Election', 1: 'Pre-Election'})
-    pbc_summary = pbc_summary.set_index(pbc_col)
-    
-    if pbc_summary.max().max() > 1000:
-        pbc_summary_plot = pbc_summary / 1e6
-        y_label = "Mean Expenditure (PHP M)"
-    else:
-        pbc_summary_plot = pbc_summary
-        y_label = "Mean Expenditure (PHP)"
-    
-    fig, ax = plt.subplots(figsize=(9,5.5), dpi=300)
-    pbc_summary_plot.plot(kind='bar', ax=ax, width=0.6, color=['#d9534f','#f0ad4e','#0275d8','#5cb85c'][:len(available_cols)])
-    ax.set_title("Empirical Political Budget Cycle")
-    ax.set_ylabel(y_label)
-    ax.set_xlabel("Electoral Cycle Phase")
-    ax.set_xticklabels(pbc_summary_plot.index, rotation=0)
-    ax.grid(axis='y', linestyle='--', alpha=0.5)
-    ax.legend([spending_map[c] for c in available_cols])
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "fig1_empirical_pbc.png"))
-    plt.close()
-    print("[✓] Figure 1 saved.")
+    fig, ax = plt.subplots(figsize=(8.5, 5))
+    for data, mu, sig, color, label in [
+        (loc, cal["mu_loc"], cal["sig_loc"], "steelblue", "Local revenue"),
+        (ira, cal["mu_ira"], cal["sig_ira"], "seagreen", "IRA"),
+    ]:
+        ks = stats.kstest(data, "lognorm", args=(sig, 0, np.exp(mu)))
+        sns.histplot(data, bins=40, stat="density", alpha=0.30,
+                     color=color, ax=ax, label=f"{label} (KS p={ks.pvalue:.2f})")
+        xs = np.linspace(0.5, float(np.percentile(data, 99.5)), 400)
+        ax.plot(xs, stats.lognorm.pdf(xs, sig, 0, np.exp(mu)),
+                color=color, linewidth=2)
+    ax.set_title(f"Figure 5. Revenue fits — {cal['level'].title()}")
+    ax.set_xlabel("Revenue (PHP M, constant 2018)")
+    ax.set_ylabel("Density")
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, f"fig5_revenue_{cal['level']}.png"))
+    plt.close(fig)
 
-# -----------------------------------------------------------------------------
-# 6. MAIN EXECUTION
-# -----------------------------------------------------------------------------
+
+def fig6_diagnostics(sim, outdir):
+    ratio_A = sim["deficit_A"] / sim["total_income"]
+    rho_pi_def = float(np.corrcoef(sim["pi_A"], ratio_A)[0, 1])
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    axes[0, 0].hist(sim["total_income"], bins=50, color="steelblue",
+                    alpha=0.75, edgecolor="black", linewidth=0.3)
+    axes[0, 0].set_title("(a) Simulated total income")
+    axes[0, 1].hist(ratio_A, bins=60, color="crimson", alpha=0.75,
+                    edgecolor="black", linewidth=0.3)
+    axes[0, 1].axvline(INSOLVENCY_THRESHOLD, color="red", linestyle="--",
+                       label=f"{INSOLVENCY_THRESHOLD:.2f} threshold")
+    axes[0, 1].set_title("(b) Deficit/income ratio (Scenario A)")
+    axes[0, 1].legend(frameon=False)
+    axes[1, 0].scatter(sim["pi_A"], ratio_A, alpha=0.25, s=4, color="purple")
+    axes[1, 0].set_title(f"(c) Vote share vs fiscal risk (ρ={rho_pi_def:+.3f})")
+    axes[1, 1].scatter(sim["total_income"], sim["deficit_A"],
+                       alpha=0.25, s=4, color="darkgreen")
+    axes[1, 1].axhline(0, color="black", linestyle="--")
+    axes[1, 1].set_title("(d) Deficit vs income")
+    fig.suptitle("Figure 6. Diagnostic plots (Scenario A, provinces)")
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, "fig6_diagnostics.png"))
+    plt.close(fig)
+
+
+def fig7_trajectories(sim, cal, outdir, n_paths=60, seed=RANDOM_SEED + 7):
+    rng = np.random.default_rng(seed)
+    mu_loc, sig_loc = cal["mu_loc"], cal["sig_loc"]
+    mu_ira, sig_ira = cal["mu_ira"], cal["sig_ira"]
+    paths = np.zeros((n_paths, N_YEARS))
+    for i in range(n_paths):
+        totexp_y = float(sim["totexp_A"][i]) * np.ones(N_YEARS)
+        inc_y = (rng.lognormal(mu_loc, sig_loc, N_YEARS)
+                 + rng.lognormal(mu_ira, sig_ira, N_YEARS))
+        paths[i] = np.cumsum(totexp_y - inc_y)
+    fig, ax = plt.subplots(figsize=(8.5, 5))
+    for i in range(n_paths):
+        ax.plot(range(1, N_YEARS + 1), paths[i],
+                color="crimson", alpha=0.20, linewidth=0.9)
+    ax.plot(range(1, N_YEARS + 1), paths.mean(axis=0),
+            "k--", linewidth=2.4, label="Mean cumulative deficit")
+    ax.axhline(0, color="navy", linestyle=":", label="Zero")
+    ax.set_title(f"Figure 7. 10-year trajectories — {cal['level'].title()}")
+    ax.set_xlabel("Years since baseline")
+    ax.set_ylabel("Cumulative deficit (PHP M)")
+    ax.legend(frameon=False, fontsize=9)
+    fig.tight_layout()
+    fig.savefig(os.path.join(outdir, f"fig7_trajectories_{cal['level']}.png"))
+    plt.close(fig)
+
+
+# =============================================================================
+# 7. MAIN
+# =============================================================================
+def main():
+    panel_path = os.path.join(_PROJECT_ROOT, "data", "panel.csv")
+    elec_prov_path = os.path.join(_PROJECT_ROOT, "data",
+                                  "election_panel_hybrid.csv")
+    elec_mayor_path = os.path.join(_PROJECT_ROOT, "data",
+                                   "election_panel_mayor.csv")
+
+    print(f"[*] Loading fiscal panel: {panel_path}")
+    fiscal = load_fiscal_panel(panel_path)
+
+    # ---------- Province ----------
+    print(f"\n[*] Loading province electoral panel: {elec_prov_path}")
+    elec_prov = load_election_panel(elec_prov_path, "Province")
+    reg_prov = build_regression_panel(fiscal, elec_prov)
+
+    # ---------- City + Municipality ----------
+    print(f"\n[*] Loading mayor electoral panel: {elec_mayor_path}")
+    elec_mayor = load_election_panel(elec_mayor_path, "City+Municipality")
+    reg_mayor = build_regression_panel(fiscal, elec_mayor)
+
+    # ---------- Elasticities by level ----------
+    e_prov = estimate_elasticities(reg_prov, "province")
+    e_city = estimate_elasticities(reg_mayor, "city")
+    e_muni = estimate_elasticities(reg_mayor, "municipality")
+
+    results = {"province": e_prov, "city": e_city, "municipality": e_muni}
+
+    table2 = build_three_level_elasticity_table(results)
+    table2.to_csv(os.path.join(OUTPUT_DIR, "table2_three_level.csv"),
+                  index=False)
+    print("\n--- Table 2 (three-level elasticities) ---")
+    print(table2.to_string(index=False))
+
+    # ---------- Calibrations ----------
+    cal_prov = calibrate_lognormal(fiscal, "province")
+    cal_city = calibrate_lognormal(fiscal, "city")
+    cal_muni = calibrate_lognormal(fiscal, "municipality")
+
+    # ---------- Monte Carlo ----------
+    print("\n[*] Running Monte Carlo (10,000 draws each) …")
+    sims = {}
+    if e_prov: sims["province"]     = run_monte_carlo(e_prov, cal_prov)
+    if e_city: sims["city"]         = run_monte_carlo(e_city, cal_city)
+    if e_muni: sims["municipality"] = run_monte_carlo(e_muni, cal_muni)
+
+    table3 = build_three_level_summary_table(sims)
+    table3.to_csv(os.path.join(OUTPUT_DIR, "table3_three_level.csv"),
+                  index=False)
+    print("\n--- Table 3 (three-level Monte Carlo) ---")
+    print(table3.to_string(index=False))
+
+    # ---------- Figures ----------
+    print("\n[*] Generating figures …")
+    fig1_empirical_pbc(fiscal, OUTPUT_DIR)
+    if "province" in sims:
+        fig2_tradeoff(sims["province"], e_prov, cal_prov, OUTPUT_DIR)
+        fig3_heatmap(sims["province"], cal_prov, OUTPUT_DIR)
+        fig4_deficit_density(sims["province"], cal_prov, OUTPUT_DIR)
+        fig5_revenue_fits(
+            fiscal[fiscal["lgutype"].str.contains("Province",
+                                                  case=False, na=False)],
+            cal_prov, OUTPUT_DIR)
+        fig6_diagnostics(sims["province"], OUTPUT_DIR)
+        fig7_trajectories(sims["province"], cal_prov, OUTPUT_DIR)
+
+    # ---------- Machine-readable summary ----------
+    def level_summary(e, s):
+        if e is None or s is None:
+            return None
+        return {
+            "n_obs": e["n_obs"], "n_lgu": e["n_lgu"],
+            "n_cycles": e["n_cycles"], "within_r2": e["within_r2"],
+            "coefficients": e["coefficients"],
+            "p_values": e["p_values"],
+            "A_1y_insolv": float(s["insolvent_A_1y"].mean()),
+            "B_1y_insolv": float(s["insolvent_B_1y"].mean()),
+            "A_mean_insolv_years": float(s["n_insolv_years_A"].mean()),
+            "B_mean_insolv_years": float(s["n_insolv_years_B"].mean()),
+        }
+
+    summary = {
+        "province":     level_summary(e_prov, sims.get("province")),
+        "city":         level_summary(e_city, sims.get("city")),
+        "municipality": level_summary(e_muni, sims.get("municipality")),
+    }
+    with open(os.path.join(OUTPUT_DIR, "results_summary_three_level.json"),
+              "w") as fh:
+        json.dump(summary, fh, indent=2, default=str)
+
+    print("\n[✓] All outputs saved to:", os.path.abspath(OUTPUT_DIR))
+
+
 if __name__ == "__main__":
-    data_path = os.path.join("..", "data", "COMELEC_fiscal+electoral_data_July 2025.xlsx")
-    print(f"[*] Loading data from: {data_path}")
-    df = load_and_clean_data(data_path)
-    
-    print("[*] Estimating voter elasticities from data...")
-    elasticities = estimate_elasticities(df)
-    
-    print("[*] Running 10,000 Monte Carlo simulations...")
-    sim_results = run_empirical_monte_carlo(df, elasticities, n_simulations=10000)
-    
-    print("[*] Generating 7 publication-ready figures...")
-    generate_visualizations(df, sim_results, elasticities)
-    
-    # Summary table
-    print("\n" + "="*70)
-    print("MONTE CARLO SIMULATION SUMMARY RESULTS")
-    print("="*70)
-    results_summary = pd.DataFrame({
-        'Metric': [
-            'Expected Total Expenditure (PHP M)',
-            'Expected Deficit / Surplus (PHP M)',
-            'Probability of Fiscal Insolvency (>5% Deficit)',
-            'Value at Risk (95% VaR Deficit, PHP M)',
-            'Mean Expected Vote Share (pi)',
-            'Vote Share Volatility (Std Dev)',
-            'Probability of 10-Year Cumulative Insolvency'
-        ],
-        'Clientelistic Surge (A)': [
-            np.mean(sim_results['totexp_A']),
-            np.mean(sim_results['deficit_A']),
-            np.mean(sim_results['insolvent_A']),
-            np.percentile(sim_results['deficit_A'], 95),
-            np.mean(sim_results['pi_A']),
-            np.std(sim_results['pi_A']),
-            np.mean(sim_results['cum_insolvent_A'])
-        ],
-        'Balanced Portfolio (B)': [
-            np.mean(sim_results['totexp_B']),
-            np.mean(sim_results['deficit_B']),
-            np.mean(sim_results['insolvent_B']),
-            np.percentile(sim_results['deficit_B'], 95),
-            np.mean(sim_results['pi_B']),
-            np.std(sim_results['pi_B']),
-            np.mean(sim_results['cum_insolvent_B'])
-        ]
-    })
-    print(results_summary.to_string(index=False))
-    print("="*70)
-    print(f"[✓] All outputs saved to '{OUTPUT_DIR}'.")
+    main()
