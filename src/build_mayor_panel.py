@@ -9,6 +9,9 @@ Matching stages, applied in order:
   D. Token-subset, province-restricted (bidirectional).
   E. Token-subset, province-agnostic, cities only (for independent cities).
   F. Drop SGA barangays and any residual unmatched rows.
+
+Adds a pi_incumbent column: previous cycle's winner's share in the current
+cycle (NaN when the previous winner did not run).
 """
 import os
 import re
@@ -43,7 +46,6 @@ OVERSEAS = {
     "SAUDI ARABIA", "UNITED ARAB EMIRATES", "QATAR", "KUWAIT",
 }
 
-# BARMM Special Geographic Area barangays (created 2019). Not standalone LGUs.
 SGA_DROP = {
     "KADAYANGAN", "KAPALAWAN", "LIGAWASAN", "MALIDEGAO",
     "NABALAWAG", "OLD KAABAKAN", "PAHAMUDDIN", "TUGUNAN",
@@ -51,8 +53,6 @@ SGA_DROP = {
 
 
 def norm(name) -> str:
-    """Aggressive normalization: strip LGU-type prefixes/suffixes,
-    replace non-alphanumeric with space, collapse."""
     if pd.isna(name):
         return ""
     s = unicodedata.normalize("NFKD", str(name))
@@ -78,7 +78,6 @@ def tokens(name: str) -> set:
 # Manual overrides (OH name → panel name; both normalized)
 # -----------------------------------------------------------------------------
 MANUAL_OVERRIDES = {
-    # --- Concatenated historical names ---
     "DARAGA LOCSIN": "DARAGA",
     "LICUAN BAAY LICUAN": "LICUAN BAAY",
     "TOBIAS FORNIER DAO": "TOBIAS FORNIER",
@@ -155,36 +154,22 @@ MANUAL_OVERRIDES = {
     "M LANG": "MLANG",
     "T BOLI": "TBOLI",
     "T`BOLI": "TBOLI",
-
-    # --- Final residuals (v5 diagnostic; panel names confirmed) ---
-    # Bohol: Jetafe is the old spelling of Getafe
-    "JETAFE":                       "GETAFE",
-    # Cebu: Pinamungajan is the modern spelling
-    "PINAMUNGAHAN":                 "PINAMUNGAJAN",
-    # Misamis Occidental: Ozamiz modern spelling
-    "OZAMIS":                       "OZAMIZ",
-    # Zamboanga del Norte: Bacungan renamed to Leon T. Postigo (2011)
-    "BACUNGAN":                     "LEON T POSTIGO",
-    "LEON B POSTIGO":               "LEON T POSTIGO",
-    # Bohol: President Carlos P. Garcia (formerly Pitogo)
-    "PRES CARLOS P GARCIA":         "PRESIDENT CARLOS P GARCIA",
-    "PRES CARLOS P GARCIA PITOGO":  "PRESIDENT CARLOS P GARCIA",
-    # Bulacan: Baliuag renamed to Baliwag (2022 conversion)
-    "BALIUAG":                      "BALIWAG",
-    # Bulacan: municipality spelled without the second "A"
-    "BULAKAN":                      "BULACAN",
-    # Cavite: abbreviation
-    "GENERAL MARIANO ALVAREZ":      "GEN MARIANO ALVAREZ",
-    # Cebu: Cordoba → Cordova (modern spelling)
-    "CORDOBA":                      "CORDOVA",
-    # Maguindanao: Pagagawan renamed Datu Paglas (2008, MMA Act 213)
-    "PAGAGAWAN":                    "DATU PAGLAS",
-    # Masbate: Pio V. Corpus (spelled with "u", not "o")
-    "PIO V CORPUZ":                 "PIO V CORPUS",
-    "PIO V CORPUZ LIMBUHAN":        "PIO V CORPUS",
-    # Nueva Ecija: identity (norm() already matches)
-    "MUNOZ":                        "MUNOZ",
-    "MATAAS NA KAHOY":              "MATAASNAKAHOY",
+    "JETAFE": "GETAFE",
+    "PINAMUNGAHAN": "PINAMUNGAJAN",
+    "OZAMIS": "OZAMIZ",
+    "BACUNGAN": "LEON T POSTIGO",
+    "LEON B POSTIGO": "LEON T POSTIGO",
+    "PRES CARLOS P GARCIA": "PRESIDENT CARLOS P GARCIA",
+    "PRES CARLOS P GARCIA PITOGO": "PRESIDENT CARLOS P GARCIA",
+    "BALIUAG": "BALIWAG",
+    "BULAKAN": "BULACAN",
+    "GENERAL MARIANO ALVAREZ": "GEN MARIANO ALVAREZ",
+    "CORDOBA": "CORDOVA",
+    "PAGAGAWAN": "DATU PAGLAS",
+    "PIO V CORPUZ": "PIO V CORPUS",
+    "PIO V CORPUZ LIMBUHAN": "PIO V CORPUS",
+    "MUNOZ": "MUNOZ",
+    "MATAAS NA KAHOY": "MATAASNAKAHOY",
 }
 
 
@@ -265,6 +250,24 @@ elec["is_incumbent"] = ((elec["prev_elecyr"] == elec["elecyr"] - 3)
 
 
 # -----------------------------------------------------------------------------
+# 3b. Add pi_incumbent: previous cycle's winner's share in current cycle.
+# -----------------------------------------------------------------------------
+cand_shares = (cand[["province_norm", "city_norm", "year",
+                     "candidate_name", "share"]]
+               .copy())
+cand_shares = cand_shares.rename(columns={"year": "elecyr",
+                                          "candidate_name": "prev_winner",
+                                          "share": "pi_incumbent"})
+
+elec = elec.merge(cand_shares,
+                  on=["province_norm", "city_norm", "elecyr", "prev_winner"],
+                  how="left")
+
+print(f"[*] pi_incumbent populated: {elec['pi_incumbent'].notna().sum():,} "
+      f"of {len(elec):,} rows")
+
+
+# -----------------------------------------------------------------------------
 # 4. Match (province, city) → PSGC10
 # -----------------------------------------------------------------------------
 panel = pd.read_csv(os.path.join(DATA, "panel.csv"), low_memory=False)
@@ -273,7 +276,7 @@ panel["prov_norm"] = panel["province"].map(norm)
 panel["lgu_type_clean"] = panel["lgu_type"].astype(str).str.strip().str.lower()
 sub = panel[panel["lgu_type_clean"].isin(["city", "municipality"])].copy()
 
-# ---- Stage A: (province, city) exact ----
+# Stage A: (province, city) exact
 lookup_two = (sub[["prov_norm", "lgu_norm", "psgc10", "lgu_name",
                    "lgu_type_clean"]]
               .drop_duplicates(["prov_norm", "lgu_norm"]))
@@ -283,7 +286,7 @@ elec = elec.merge(
     on=["province_norm", "city_norm"], how="left")
 print(f"[*] Stage A: {elec['psgc10'].notna().sum():,} / {len(elec):,}")
 
-# ---- Stage B: (city) exact, province-agnostic ----
+# Stage B: (city) exact, province-agnostic
 missing = elec["psgc10"].isna()
 lookup_one = (sub.drop_duplicates("lgu_norm")
                  .set_index("lgu_norm")[["psgc10", "lgu_name",
@@ -294,7 +297,7 @@ elec.loc[missing, "lgu_name"] = m.map(lookup_one["lgu_name"]).values
 elec.loc[missing, "lgu_type_clean"] = m.map(lookup_one["lgu_type_clean"]).values
 print(f"[*] Stage B: {elec['psgc10'].notna().sum():,} / {len(elec):,}")
 
-# ---- Stage C: manual overrides ----
+# Stage C: manual overrides
 missing = elec["psgc10"].isna()
 panel_by_norm = (sub.drop_duplicates("lgu_norm")
                     .set_index("lgu_norm")[["psgc10", "lgu_name",
@@ -308,18 +311,15 @@ elec.loc[missing, "lgu_type_clean"] = (
     mapped.map(panel_by_norm["lgu_type_clean"]).values)
 print(f"[*] Stage C: {elec['psgc10'].notna().sum():,} / {len(elec):,}")
 
-# ---- Stage D: token subset, province-restricted (bidirectional) ----
+# Stage D: token subset, province-restricted
 missing = elec["psgc10"].isna()
 panel_by_prov = {}
 for prov, grp in sub.groupby("prov_norm"):
     panel_by_prov[prov] = list(zip(grp["lgu_norm"], grp["psgc10"],
                                    grp["lgu_name"], grp["lgu_type_clean"]))
 
+
 def token_subset(city_norm, candidate_rows):
-    """
-    Match if panel tokens ⊆ OH tokens OR OH tokens ⊆ panel tokens.
-    Picks the panel row with the largest intersection (most specific).
-    """
     oh_tokens = set(city_norm.split())
     hits = []
     for lgu_norm, psgc, lgu_name, lgu_type in candidate_rows:
@@ -327,7 +327,6 @@ def token_subset(city_norm, candidate_rows):
         if not panel_tokens:
             continue
         if panel_tokens.issubset(oh_tokens) or oh_tokens.issubset(panel_tokens):
-            # Score = |intersection| minus |extra tokens| penalty
             score = len(panel_tokens & oh_tokens) - 0.1 * len(panel_tokens ^ oh_tokens)
             hits.append((score, psgc, lgu_name, lgu_type))
     if not hits:
@@ -335,6 +334,7 @@ def token_subset(city_norm, candidate_rows):
     hits.sort(reverse=True)
     _, psgc, lgu_name, lgu_type = hits[0]
     return (psgc, lgu_name, lgu_type)
+
 
 if missing.any():
     for idx in elec.index[missing]:
@@ -347,7 +347,7 @@ if missing.any():
         elec.at[idx, "lgu_type_clean"] = lgu_type
 print(f"[*] Stage D: {elec['psgc10'].notna().sum():,} / {len(elec):,}")
 
-# ---- Stage E: token subset, province-agnostic, cities only ----
+# Stage E: token subset, province-agnostic, cities only
 missing = elec["psgc10"].isna()
 city_panel_rows = list(zip(sub[sub["lgu_type_clean"] == "city"]["lgu_norm"],
                            sub[sub["lgu_type_clean"] == "city"]["psgc10"],
@@ -362,7 +362,7 @@ if missing.any():
         elec.at[idx, "lgu_type_clean"] = lgu_type
 print(f"[*] Stage E: {elec['psgc10'].notna().sum():,} / {len(elec):,}")
 
-# ---- Stage F: drop SGA rows, then any residual ----
+# Stage F: drop SGA rows, then any residual
 before_sga = len(elec)
 elec = elec[~elec["city_norm"].isin(SGA_DROP)].copy()
 if len(elec) < before_sga:
@@ -380,14 +380,14 @@ if still_missing.any():
 else:
     print("\n[✓] All pairs mapped.")
 
-# ---- Finalize ----
+# Finalize
 elec["psgc10"] = (elec["psgc10"].astype(str).str.strip()
                   .str.replace(r"\.0$", "", regex=True).str.zfill(10))
 elec = elec.rename(columns={"lgu_type_clean": "lgutype"})
 elec = elec[elec["n_candidates"] > 1]
 
 out = elec[["psgc10", "lgu_name", "lgutype", "elecyr",
-            "pi", "ENC_lt", "n_candidates",
+            "pi", "pi_incumbent", "ENC_lt", "n_candidates",
             "winner_name", "prev_winner", "is_incumbent"]]
 out = out.sort_values(["psgc10", "elecyr"]).reset_index(drop=True)
 out.to_csv(os.path.join(DATA, "election_panel_mayor.csv"), index=False)
@@ -401,7 +401,11 @@ print(f"    municips:   "
       f"{out[out['lgutype']=='municipality']['psgc10'].nunique()} "
       f"(panel has 1,483)")
 print(f"    cycles:     {sorted(out['elecyr'].astype(int).unique())}")
-print(f"\nπ:   mean={out['pi'].mean():.3f}  sd={out['pi'].std():.3f}")
-print(f"ENC: mean={out['ENC_lt'].mean():.3f}  sd={out['ENC_lt'].std():.3f}")
+print(f"\nπ:            mean={out['pi'].mean():.3f}  sd={out['pi'].std():.3f}")
+print(f"π_incumbent:  mean={out['pi_incumbent'].mean():.3f}  "
+      f"sd={out['pi_incumbent'].std():.3f}  "
+      f"N={out['pi_incumbent'].notna().sum():,}")
+print(f"ENC:          mean={out['ENC_lt'].mean():.3f}  "
+      f"sd={out['ENC_lt'].std():.3f}")
 print(f"Incumbent share: {out['is_incumbent'].mean():.3f}")
 print(f"\nRows per cycle:\n{out.groupby('elecyr').size().to_string()}")

@@ -16,4 +16,4 @@ seaborn>=0.13,<1
 # --- Optional but useful ----------------------------------------------------
 # pyarrow>=15,<20          # faster parquet I/O
 # jupyterlab>=4,<5         # interactive exploration
-# linearmodels>=6,<7       # panel models if you switch away from manual FE
+linearmodels>=6.1,<7      # panel models if you switch away from manual FE

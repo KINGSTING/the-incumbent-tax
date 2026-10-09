@@ -6,6 +6,9 @@ The raw file reports one row per (candidate, city) pair. For governor races
 each candidate therefore appears once per city in the province. We collapse
 to one row per (province, cycle, candidate) by summing votes across cities,
 then compute the winner, vote share, and effective number of candidates.
+
+Adds a pi_incumbent column: the previous cycle's winner's share in the current
+cycle (NaN when the previous winner did not run).
 """
 import os
 import re
@@ -26,8 +29,8 @@ RENAME_MAP = {
     "MT. PROVINCE": "MOUNTAIN PROVINCE",
     "NORTH COTABATO": "COTABATO",
     "SHARIFF KABUNSUAN": "MAGUINDANAO",
-    "TAWI TAWI": "TAWI-TAWI",              # panel uses hyphen
-    "MAGUINDANAO": "MAGUINDANAO",          # placeholder; see below
+    "TAWI TAWI": "TAWI-TAWI",
+    "MAGUINDANAO": "MAGUINDANAO",
 }
 
 OVERSEAS = {
@@ -74,7 +77,6 @@ print(f"[*] Raw governor rows:      {len(gov):,}")
 print(f"[*] Distinct provinces:     {gov['province_norm'].nunique()}")
 print(f"[*] Cycles:                 {sorted(gov['year'].dropna().unique().astype(int))}")
 
-# Diagnostic: rows per (province, year) BEFORE aggregation
 pre = gov.groupby(["province_norm", "year"]).size()
 print(f"[*] Rows per province-cycle — "
       f"median {int(pre.median())}, max {int(pre.max())}")
@@ -87,7 +89,6 @@ gov_cand = (
        ["votes"].sum()
 )
 
-# Diagnostic: distinct candidates per province-cycle AFTER aggregation
 post = gov_cand.groupby(["province_norm", "year"]).size()
 print(f"[*] Candidates per province-cycle — "
       f"median {int(post.median())}, max {int(post.max())}")
@@ -158,6 +159,22 @@ elec["is_incumbent"] = (
 )
 
 # -----------------------------------------------------------------------------
+# 6b. Add pi_incumbent: previous cycle's winner's share in the current cycle.
+# -----------------------------------------------------------------------------
+cand_shares = (gov_cand[["province_norm", "year", "candidate_name", "share"]]
+               .copy())
+cand_shares = cand_shares.rename(columns={"year": "elecyr",
+                                          "candidate_name": "prev_winner",
+                                          "share": "pi_incumbent"})
+
+elec = elec.merge(cand_shares,
+                  on=["province_norm", "elecyr", "prev_winner"],
+                  how="left")
+
+print(f"[*] pi_incumbent populated: {elec['pi_incumbent'].notna().sum():,} "
+      f"of {len(elec):,} rows")
+
+# -----------------------------------------------------------------------------
 # 7. Map province names to PSGC10
 # -----------------------------------------------------------------------------
 panel = pd.read_csv(panel_path, low_memory=False)
@@ -179,7 +196,6 @@ if unmapped:
     print(f"\n[!] {len(unmapped)} provinces did not map to PSGC10:")
     for p in unmapped:
         print(f"    - {p}")
-    # Show what panel contains that might be a variant
     print("\n    Panel province names near the miss:")
     for u in unmapped:
         stem = u.split()[0]
@@ -195,7 +211,7 @@ else:
 # -----------------------------------------------------------------------------
 out = elec[[
     "psgc10", "lgu_name", "province_norm", "elecyr",
-    "pi", "ENC_lt", "n_candidates",
+    "pi", "pi_incumbent", "ENC_lt", "n_candidates",
     "winner_name", "prev_winner", "is_incumbent",
 ]].copy()
 
@@ -216,16 +232,13 @@ print(f"    provinces with electoral data:  {out['psgc10'].nunique()}")
 print(f"    cycles:                         "
       f"{sorted(out['elecyr'].astype(int).unique())}")
 
-print(f"\nπ summary (should be ~0.3–0.7 typical):")
+print(f"\nπ summary:")
 print(out["pi"].describe().to_string())
 
-print(f"\nENC_lt summary (should be ~1–4 typical):")
+print(f"\nπ_incumbent summary:")
+print(out["pi_incumbent"].describe().to_string())
+
+print(f"\nENC_lt summary:")
 print(out["ENC_lt"].describe().to_string())
 
-print(f"\nN candidates per race:")
-print(out["n_candidates"].describe().to_string())
-
 print(f"\nIncumbent share of races: {out['is_incumbent'].mean():.3f}")
-
-print(f"\nFirst 15 rows:")
-print(out.head(15).to_string())

@@ -1,13 +1,13 @@
 """
 Build a hybrid province-cycle electoral panel.
 
-  • Cycles 1992–2004: from the COMELEC extract (original submission source).
-  • Cycles 2007–2025: from OpenHalalan (cleaner, publicly verifiable).
-  • Overlapping cycles (2007–2022): both sources available — we use OpenHalalan
-    for the regression and report the cross-source correlation as a validation.
+  • Cycles 1992–2004: from the COMELEC extract.
+  • Cycles 2007–2025: from OpenHalalan.
+  • Overlapping cycles: OpenHalalan wins.
 
 Output: data/election_panel_hybrid.csv with columns
-    psgc10 | lgu_name | elecyr | pi | ENC_lt | n_candidates | source
+    psgc10 | lgu_name | elecyr | pi | pi_incumbent | ENC_lt
+    | n_candidates | source
 """
 import os
 import re
@@ -26,6 +26,7 @@ RENAME_MAP = {
     "SHARIFF KABUNSUAN": "MAGUINDANAO",
     "TAWI TAWI": "TAWI-TAWI",
 }
+
 
 def norm(name) -> str:
     if pd.isna(name):
@@ -50,7 +51,6 @@ old["pi"] = pd.to_numeric(old["pi"], errors="coerce")
 old["ENC_lt"] = pd.to_numeric(old["ENC_lt"], errors="coerce")
 old["lgu_key"] = old["lgu"].map(norm)
 
-# Restrict to provinces, cycles ≤ 2004, and drop sentinel rows
 prov = old[(old["lgutype_clean"] == "province")
            & (old["elecyr"] <= 2004)
            & old["pi"].notna() & old["ENC_lt"].notna()]
@@ -59,9 +59,8 @@ prov = prov[(prov["pi"] > 0) & (prov["pi"] <= 1)
 
 pre = prov[["lgu_key", "elecyr", "pi", "ENC_lt"]].copy()
 pre["source"] = "COMELEC"
-
-# n_candidates not available in the old extract — carry NaN
 pre["n_candidates"] = np.nan
+pre["pi_incumbent"] = np.nan   # not available for pre-2007
 print(f"[*] Pre-2007 rows kept: {len(pre):,} "
       f"({pre['elecyr'].nunique()} cycles, "
       f"{pre['lgu_key'].nunique()} provinces)")
@@ -74,8 +73,18 @@ print("\n[*] Loading OpenHalalan panel …")
 oh = pd.read_csv(os.path.join(DATA, "election_panel.csv"))
 oh["elecyr"] = pd.to_numeric(oh["elecyr"], errors="coerce")
 oh["lgu_key"] = oh["province_norm"].map(norm)
-post = oh[["lgu_key", "elecyr", "pi", "ENC_lt", "n_candidates"]].copy()
+
+cols_post = ["lgu_key", "elecyr", "pi", "ENC_lt", "n_candidates"]
+if "pi_incumbent" in oh.columns:
+    cols_post.append("pi_incumbent")
+
+post = oh[cols_post].copy()
 post["source"] = "OpenHalalan"
+
+if "pi_incumbent" not in post.columns:
+    post["pi_incumbent"] = np.nan
+    print("[!] pi_incumbent not found in OpenHalalan panel — carrying NaN")
+
 print(f"[*] Post-2007 rows kept: {len(post):,} "
       f"({post['elecyr'].nunique()} cycles, "
       f"{post['lgu_key'].nunique()} provinces)")
@@ -84,14 +93,13 @@ print(f"[*] Post-2007 rows kept: {len(post):,} "
 # -----------------------------------------------------------------------------
 # 3. Combine and map names → PSGC10
 # -----------------------------------------------------------------------------
-combined = pd.concat([pre, post], ignore_index=True)
+combined = pd.concat([pre, post], ignore_index=True, sort=False)
 combined = combined.dropna(subset=["lgu_key", "elecyr"])
 combined["elecyr"] = combined["elecyr"].astype(int)
 
 panel = pd.read_csv(os.path.join(DATA, "panel.csv"), low_memory=False)
 panel["lgu_name_norm"] = panel["lgu_name"].map(norm)
 
-# Manual patch for Maguindanao pre-2019: parent province PSGC
 mag_parent = panel[panel["lgu_name"].str.strip().str.upper() == "MAGUINDANAO"]
 mag_psgc = mag_parent["psgc10"].iloc[0] if not mag_parent.empty else None
 
@@ -102,13 +110,11 @@ lookup = (panel[panel["lgu_type"].str.strip().str.lower() == "province"]
 combined = combined.merge(lookup, left_on="lgu_key",
                           right_on="lgu_name_norm", how="left")
 
-# Patch missing Maguindanao
 if mag_psgc is not None:
     mask = (combined["lgu_key"] == "MAGUINDANAO") & combined["psgc10"].isna()
     combined.loc[mask, "psgc10"] = mag_psgc
     combined.loc[mask, "lgu_name"] = "Maguindanao"
 
-# Drop post-2019 Maguindanao (split into del Norte / del Sur)
 combined = combined[~((combined["lgu_key"] == "MAGUINDANAO")
                       & (combined["elecyr"] >= 2019))]
 
@@ -122,16 +128,14 @@ combined = combined.dropna(subset=["psgc10"])
 combined["psgc10"] = (combined["psgc10"].astype(str).str.strip()
                       .str.replace(r"\.0$", "", regex=True).str.zfill(10))
 
-# Exactly one row per (province, cycle) — OpenHalalan wins when both present
-combined = (combined.sort_values(["psgc10", "elecyr",
-                                  "source"],
+combined = (combined.sort_values(["psgc10", "elecyr", "source"],
                                  key=lambda s: s.map({"OpenHalalan": 0,
                                                       "COMELEC": 1})
                                  if s.name == "source" else s)
                      .drop_duplicates(["psgc10", "elecyr"], keep="first"))
 
 out = combined[["psgc10", "lgu_name", "elecyr",
-                "pi", "ENC_lt", "n_candidates", "source"]]
+                "pi", "pi_incumbent", "ENC_lt", "n_candidates", "source"]]
 out = out.sort_values(["psgc10", "elecyr"]).reset_index(drop=True)
 
 out_path = os.path.join(DATA, "election_panel_hybrid.csv")
@@ -142,24 +146,11 @@ print(f"    rows:                     {len(out):,}")
 print(f"    provinces:                {out['psgc10'].nunique()}")
 print(f"    cycles:                   {sorted(out['elecyr'].unique())}")
 print(f"    rows by source:\n{out['source'].value_counts().to_string()}")
-
-
-# -----------------------------------------------------------------------------
-# 4. Cross-source validation on overlapping cycles
-# -----------------------------------------------------------------------------
-print("\n[*] Cross-source validation on overlapping cycles (2007–2022) …")
-overlap = (pre.merge(post, on=["lgu_key", "elecyr"],
-                     suffixes=("_comelec", "_oh"), how="inner"))
-if len(overlap) > 10:
-    rho = overlap[["pi_comelec", "pi_oh"]].corr().iloc[0, 1]
-    mad = (overlap["pi_comelec"] - overlap["pi_oh"]).abs().mean()
-    print(f"    N overlapping province-cycles: {len(overlap):,}")
-    print(f"    Pearson r (π_COMELEC vs π_OpenHalalan): {rho:.4f}")
-    print(f"    Mean absolute difference: {mad:.4f}")
-else:
-    print("    Insufficient overlapping rows to validate.")
+print(f"    pi_incumbent populated:   {out['pi_incumbent'].notna().sum():,}")
 
 print("\nπ summary (hybrid panel):")
 print(out["pi"].describe().to_string())
+print("\nπ_incumbent summary:")
+print(out["pi_incumbent"].describe().to_string())
 print("\nENC_lt summary:")
 print(out["ENC_lt"].describe().to_string())
